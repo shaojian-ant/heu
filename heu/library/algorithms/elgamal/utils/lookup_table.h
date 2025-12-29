@@ -21,6 +21,7 @@
 
 namespace heu::lib::algorithms::elgamal {
 
+using yacl::crypto::AffineAnyEcPoint;
 using yacl::crypto::EcGroup;
 using yacl::crypto::EcPoint;
 
@@ -34,12 +35,10 @@ class LookupTable {
   static const MPInt &MaxSupportedValue();
 
  private:
-  // mG -> m
-  std::shared_ptr<HashMap<EcPoint, int64_t>> table_;
-  EcPoint table_max_pos_;
-  EcPoint table_max_neg_;
-
-  std::shared_ptr<EcGroup> curve_;
+  class Impl1;
+  class Impl2;
+  std::shared_ptr<Impl1> pImpl1;
+  std::shared_ptr<Impl2> pImpl2;  // use Montgomery’s Trick
 };
 
 }  // namespace heu::lib::algorithms::elgamal

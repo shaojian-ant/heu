@@ -136,6 +136,19 @@ class PheBenchmarks {
   }
 
   void Decrypt(benchmark::State &state) {
+    if (he_kit_->GetSchemaType() == phe::SchemaType::ElGamal) {
+      const auto &encryptor = he_kit_->GetEncryptor();
+      const auto &edr = he_kit_->GetEncoder<phe::PlainEncoder>(1);
+      const auto &max = algorithms::elgamal::LookupTable::MaxSupportedValue();
+      for (int i = 0; i < kTestSize; ++i) {
+        yacl::math::MPInt r;
+        yacl::math::MPInt::RandomLtN(max, &r);
+        // ((i & 2) - 1) equals to -1 or 1
+        pts_[i] = edr.Encode(((i & 2) - 1) * r.Get<int64_t>());
+        cts_[i] = encryptor->Encrypt(pts_[i]);
+      }
+    }
+
     // decrypt
     const auto &decryptor = he_kit_->GetDecryptor();
     for (auto _ : state) {

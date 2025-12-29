@@ -23,7 +23,7 @@ Evaluator::Evaluator(const PublicKey &pk) : pk_(pk) {
 
 void Evaluator::Randomize(Ciphertext *ct) const {
   MPInt r;
-  MPInt::RandomLtN(ec_->GetField(), &r);
+  MPInt::RandomLtN(ec_->GetOrder(), &r);
   AddInplace(ct, Ciphertext(ec_, ec_->MulBase(r), ec_->Mul(pk_.GetH(), r)));
 }
 
