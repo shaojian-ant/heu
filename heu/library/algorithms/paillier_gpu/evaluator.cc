@@ -15,6 +15,9 @@
 #include "heu/library/algorithms/paillier_gpu/evaluator.h"
 
 #include "heu/library/algorithms/util/he_assert.h"
+#include "heu/library/algorithms/paillier_gpu/gpulib/nvtx_wrapper.h"
+
+using heu::lib::algorithms::paillier_gpu::NvtxRange;
 
 namespace heu::lib::algorithms::paillier_g {
 
@@ -32,6 +35,7 @@ void Evaluator::Randomize(Span<Ciphertext> ct) const {
 
 std::vector<Ciphertext> Evaluator::Add(ConstSpan<Ciphertext> ct0,
                                        ConstSpan<Ciphertext> ct1) const {
+  NvtxRange chunk_range("Evaluator::Add(ConstSpan<Ciphertext>,ConstSpan<Ciphertext>)");
   // a. pubkey;
   h_paillier_pubkey_t g_pk;
   pk_.n_.ToBytes(g_pk.n, 512, algorithms::Endian::little);
@@ -41,21 +45,36 @@ std::vector<Ciphertext> Evaluator::Add(ConstSpan<Ciphertext> ct0,
   // b. batch size;
   unsigned int count = ct0.size();
 
+  nvtxRangePushA("alloc host memory 1");
   // c. Host memory
   auto res = std::make_unique<h_paillier_ciphertext_t[]>(count);
   auto gct0 = std::make_unique<h_paillier_ciphertext_t[]>(count);
   auto gct1 = std::make_unique<h_paillier_ciphertext_t[]>(count);
-  for (unsigned int i = 0; i < count; i++) {
-    gct0[i] = ct0[i]->ct_;
-    gct1[i] = ct1[i]->ct_;
+  nvtxRangePop();
+
+  // Parallel data preparation
+  {
+    NvtxRange prep_range("Add_prepare_data");
+    for (unsigned int i = 0; i < count; i++) {
+      gct0[i] = ct0[i]->ct_;
+      gct1[i] = ct1[i]->ct_;
+    }
   }
+
   // d. GPU do cipher add
   gpu_paillier_e_add(&g_pk, res.get(), gct0.get(), gct1.get(), count);
 
+  nvtxRangePushA("alloc host memory 2");
   // e. to vector<Ciphertext>
   std::vector<Ciphertext> ctx_res(count);
-  for (unsigned int i = 0; i < count; i++) {
-    ctx_res[i].ct_ = res[i];
+  nvtxRangePop();
+
+  // Parallel result conversion
+  {
+    NvtxRange conv_range("Add_convert_result");
+    for (unsigned int i = 0; i < count; i++) {
+      ctx_res[i].ct_ = res[i];
+    }
   }
 
   return ctx_res;

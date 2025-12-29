@@ -17,6 +17,7 @@ load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
 
 def heu_cpp_deps():
     _com_github_nvlabs_cgbn()
+    _com_github_rapidsai_rmm()
 
 def _com_github_nvlabs_cgbn():
     maybe(
@@ -31,5 +32,17 @@ def _com_github_nvlabs_cgbn():
         ],
         urls = [
             "https://github.com/NVlabs/CGBN/archive/e8b9d265c7b84077d02340b0986f3c91b2eb02fb.tar.gz",
+        ],
+    )
+
+def _com_github_rapidsai_rmm():
+    maybe(
+        http_archive,
+        name = "rmm",
+        sha256 = "33d1972bce23e9b45d0c1aedabfbc3fd2d2cb30715fa66d17088dd276d01e56c",
+        build_file = "//third_party/bazel_cpp:rmm.BUILD",
+        strip_prefix = "rmm-25.10.00",
+        urls = [
+            "https://github.com/rapidsai/rmm/archive/refs/tags/v25.10.00.tar.gz",
         ],
     )

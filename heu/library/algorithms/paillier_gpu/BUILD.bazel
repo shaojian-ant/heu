@@ -65,23 +65,38 @@ yacl_cc_library(
 cuda_library(
     name = "gpupaillier",
     srcs = [
+        "gpulib/cuda_stream_pool.cc",
         "gpulib/paillier.cu",
+        "gpulib/rmm_memory_pool.cc",
     ],
     hdrs = [
+        "gpulib/cuda_stream_pool.h",
         "gpulib/error.h",
         "gpulib/gpu_paillier.h",
         "gpulib/gpupaillier.h",
+        "gpulib/nvtx_wrapper.h",
+        "gpulib/rmm_memory_pool.h",
     ],
     copts = [
         "-lcuda",
         "-lcudart",
         "-std=c++17",
+        "-DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE",
+    ],
+    defines = [
+        "LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE",
+    ],
+    linkopts = [
+        "-lnvtx3",
+        "-lcuda",
+        "-lcudart",
     ],
     tags = [
         "manual",
     ],
     deps = [
         "@com_github_nvlabs_cgbn//:cgbn",
+        "@rmm",
     ],
 )
 

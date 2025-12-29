@@ -12,9 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdlib>
+
 #include "heu/library/algorithms/paillier_gpu/gpulib/error.h"
 #include "heu/library/algorithms/paillier_gpu/gpulib/gpu_paillier.h"
 #include "heu/library/algorithms/paillier_gpu/gpulib/gpupaillier.h"
+#include "heu/library/algorithms/paillier_gpu/gpulib/rmm_memory_pool.h"
+#include "heu/library/algorithms/paillier_gpu/gpulib/cuda_stream_pool.h"
+#include "heu/library/algorithms/paillier_gpu/gpulib/nvtx_wrapper.h"
+
+using heu::lib::algorithms::paillier_gpu::RMMMemoryPool;
+using heu::lib::algorithms::paillier_gpu::make_device_buffer;
+using heu::lib::algorithms::paillier_gpu::CudaStreamPool;
+using heu::lib::algorithms::paillier_gpu::StreamGuard;
+using heu::lib::algorithms::paillier_gpu::get_stream;
+using heu::lib::algorithms::paillier_gpu::NvtxRange;
 
 template <class params>
 __device__ __forceinline__ void paillier_t<params>::fixed_window_powm_odd(
@@ -394,243 +406,91 @@ void cudainit() {
   if (error_t != cudaSuccess) printf("cuda error\n");
   error_t = cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
   if (error_t != cudaSuccess) printf("cuda error\n");
+
+  // Ensure CUDA stream pool is initialized (happens automatically on first access)
+  // The pool size is determined by HEU_CUDA_STREAM_POOL_SIZE environment variable
+  // or defaults to 128 streams
+  CudaStreamPool::GetInstance();
+
+  // Initialize RMM memory pool to ensure it's ready before any allocations
+  // This sets up the pool_memory_resource as the current device resource
+  RMMMemoryPool::GetInstance().Initialize();
 }
 
-//*********************************************gpu
-// api*****************************************
-int gpu_paillier_enc_bk(h_paillier_ciphertext_t *res, h_paillier_pubkey_t *pub,
-                        h_paillier_plaintext_t *pt, h_paillier_random_t *rand,
-                        unsigned int count) {
-  int32_t TPB = (params::TPB == 0)
-                    ? 64
-                    : params::TPB;  // default threads per block to 128
-  int32_t TPI = params::TPI, IPB = TPB / TPI;
-
-  unsigned int ps, BPG;
-  BPG = 256;
-  ps = TPB * BPG;  // kernel parallel ,256 means blocks per Grid
-
-  unsigned int rem, sm_num, sm_count, sm_count_tail, loop, i = 0, j = 0;
-  sm_num = 3;  // 3 streams is enough
-  if (count < 3) {
-    sm_num = 1;
-  }
-  sm_count = count / sm_num;  // sm_count may be bigger than ps
-  sm_count_tail =
-      count -
-      sm_count * sm_num;  // it is very important ,the count number should be
-                          // the multiples of 3, if not it will left 1，2。
-  // sm_count_malloc=sm_count+sm_count_tail;//+2 for the left data,it's depends
-  loop = sm_count /
-         ps;  // loop could be 0, loops for each stream,every time is ps.
-  if (sm_num == 1) {
-    loop = 0;
-  }
-
-  cudainit();
-  cudaStream_t stream[sm_num];
-  // create stream
-  for (i = 0; i < sm_num; i++) {
-    cudaStreamCreate(&(stream[i]));
-  }
-
-  // malloc for each stream
-  gpu_paillier_ciphertext_t *gpu_result[sm_num];
-  gpu_paillier_pubkey_t *gpu_pub[sm_num];
-  gpu_paillier_plaintext_t *gpu_pt[sm_num];
-  gpu_paillier_random_t *gpu_random[sm_num];
-  cgbn_error_report_t *report[sm_num];
-  for (i = 0; i < sm_num; i++) {
-    CUDA_CHECK(cudaMalloc((void **)&gpu_result[i],
-                          sizeof(gpu_paillier_ciphertext_t) * ps));
-    CUDA_CHECK(cudaMalloc((void **)&gpu_pub[i], sizeof(gpu_paillier_pubkey_t)));
-    CUDA_CHECK(
-        cudaMalloc((void **)&gpu_pt[i], sizeof(gpu_paillier_plaintext_t) * ps));
-    CUDA_CHECK(cudaMalloc((void **)&gpu_random[i],
-                          sizeof(gpu_paillier_random_t) * ps));
-    CUDA_CHECK(cgbn_error_report_alloc(&report[i]));
-  }
-
-  if (loop == 0) {
-    rem = sm_count;
-  } else {
-    rem = sm_count - loop * ps;  // each stream has rem, except count is < 3.
-  }
-
-  printf("sm_count:%d, sm_count_tail:%d,loop:%d,sm_Num:%d,rem:%d,ps:%d\n",
-         sm_count, sm_count_tail, loop, sm_num, rem, ps);
-  for (i = 0; i < loop; i++)  // all it ps,the wave
-  {
-    for (j = 0; j < sm_num; j++) {
-      cudaMemcpyAsync((void *)(gpu_pt[j]),
-                      (pt + sm_num * i * ps * sizeof(gpu_paillier_plaintext_t) +
-                       j * ps * sizeof(gpu_paillier_plaintext_t)),
-                      sizeof(gpu_paillier_plaintext_t) * ps,
-                      cudaMemcpyHostToDevice, stream[j]);
-      cudaMemcpyAsync((void *)gpu_pub[j], pub, sizeof(gpu_paillier_pubkey_t),
-                      cudaMemcpyHostToDevice, stream[j]);
-      cudaMemcpyAsync((void *)(gpu_random[j]),
-                      (rand + sm_num * i * ps * sizeof(gpu_paillier_random_t) +
-                       j * ps * sizeof(gpu_paillier_random_t)),
-                      sizeof(gpu_paillier_random_t) * ps,
-                      cudaMemcpyHostToDevice, stream[j]);
-      // kernel_paillier_enc<params>  <<< BPG, TPB,0,stream[j]  >>> (report[i],
-      // gpu_result[j], gpu_pub[j], gpu_pt[j], gpu_random[j], ps);
-      kernel_paillier_enc<params><<<(ps + IPB - 1) / IPB, TPB, 0, stream[j]>>>(
-          report[i], gpu_result[j], gpu_pub[j], gpu_pt[j], gpu_random[j], ps);
-
-      cudaMemcpyAsync(
-          (void *)(res + sm_num * i * ps * sizeof(gpu_paillier_ciphertext_t) +
-                   j * ps * sizeof(gpu_paillier_ciphertext_t)),
-          (gpu_result[j]), sizeof(gpu_paillier_ciphertext_t) * ps,
-          cudaMemcpyDeviceToHost, stream[j]);
-      printf("loop!=0: %d,stream number:%d\n", i, j);
-    }
-  }
-
-  i = loop;
-  for (j = 0; j < sm_num; j++)  // the rem ,works well
-  {
-    cudaMemcpyAsync((void *)(gpu_pt[j]),
-                    (pt + sm_num * i * ps * sizeof(gpu_paillier_plaintext_t) +
-                     j * rem * sizeof(gpu_paillier_plaintext_t)),
-                    sizeof(gpu_paillier_plaintext_t) * rem,
-                    cudaMemcpyHostToDevice, stream[j]);
-    cudaMemcpyAsync((void *)gpu_pub[j], pub, sizeof(gpu_paillier_pubkey_t),
-                    cudaMemcpyHostToDevice, stream[j]);
-    cudaMemcpyAsync((void *)(gpu_random[j]),
-                    (rand + sm_num * i * ps * sizeof(gpu_paillier_random_t) +
-                     j * rem * sizeof(gpu_paillier_random_t)),
-                    sizeof(gpu_paillier_random_t) * rem, cudaMemcpyHostToDevice,
-                    stream[j]);
-    // kernel_paillier_enc<params>  <<< BPG, TPB,0,stream[j] >>> (report[i],
-    // gpu_result[j], gpu_pub[j], gpu_pt[j], gpu_random[j], rem);
-    kernel_paillier_enc<params><<<(rem + IPB - 1) / IPB, TPB, 0, stream[j]>>>(
-        report[i], gpu_result[j], gpu_pub[j], gpu_pt[j], gpu_random[j], rem);
-
-    cudaMemcpyAsync(
-        (void *)(res + sm_num * i * ps * sizeof(gpu_paillier_ciphertext_t) +
-                 j * rem * sizeof(gpu_paillier_ciphertext_t)),
-        (gpu_result[j]), sizeof(gpu_paillier_ciphertext_t) * rem,
-        cudaMemcpyDeviceToHost, stream[j]);
-    printf("loop=i: %d,stream number:%d\n", i, j);
-  }
-  j = 0;
-  if (sm_count_tail > 0) {
-    cudaMemcpyAsync((void *)(gpu_pt[j]),
-                    (pt + sm_num * i * ps * sizeof(gpu_paillier_plaintext_t) +
-                     sm_num * rem * sizeof(gpu_paillier_plaintext_t)),
-                    sizeof(gpu_paillier_plaintext_t) * sm_count_tail,
-                    cudaMemcpyHostToDevice, stream[j]);
-    cudaMemcpyAsync((void *)gpu_pub[j], pub, sizeof(gpu_paillier_pubkey_t),
-                    cudaMemcpyHostToDevice, stream[j]);
-    cudaMemcpyAsync((void *)(gpu_random[j]),
-                    (rand + sm_num * i * ps * sizeof(gpu_paillier_random_t) +
-                     sm_num * rem * sizeof(gpu_paillier_random_t)),
-                    sizeof(gpu_paillier_random_t) * sm_count_tail,
-                    cudaMemcpyHostToDevice, stream[j]);
-    // kernel_paillier_enc<params> <<< BPG, TPB,0,stream[j] >>> (report[i],
-    // gpu_result[j], gpu_pub[j], gpu_pt[j], gpu_random[j], sm_count_tail);
-    kernel_paillier_enc<params>
-        <<<(sm_count_tail + IPB - 1) / IPB, TPB, 0, stream[j]>>>(
-            report[i], gpu_result[j], gpu_pub[j], gpu_pt[j], gpu_random[j],
-            sm_count_tail);
-
-    cudaMemcpyAsync(
-        (void *)(res + sm_num * i * ps * sizeof(gpu_paillier_ciphertext_t) +
-                 sm_num * rem * sizeof(gpu_paillier_ciphertext_t)),
-        (gpu_result[j]), sizeof(gpu_paillier_ciphertext_t) * sm_count_tail,
-        cudaMemcpyDeviceToHost, stream[j]);
-    printf("sm_count_tail ,stream number:%d\n", j);
-  }
-  for (j = 0; j < sm_num; j++) {
-    cudaStreamSynchronize(stream[j]);
-  }
-  for (int j = 0; j < sm_num; j++) {
-    cudaStreamDestroy(stream[j]);
-  }
-  CUDA_LAST_CHECK();
-  for (i = 0; i < sm_num; i++) {
-    CUDA_CHECK(cudaFree(gpu_pt[i]));      // data_in_gpu
-    CUDA_CHECK(cudaFree(gpu_pub[i]));     // pub
-    CUDA_CHECK(cudaFree(gpu_random[i]));  // random data
-    CUDA_CHECK(cudaFree(gpu_result[i]));  // cm
-    CGBN_CHECK(report[i]);
-    CUDA_CHECK(cgbn_error_report_free(report[i]));
-  }
-
-  return 0;
-}
-
+// Asynchronous version of gpu_paillier_enc using CUDA stream pool
+// All threads share a single stream pool for concurrent execution
 int gpu_paillier_enc(h_paillier_ciphertext_t *res, h_paillier_pubkey_t *pub,
-                     h_paillier_plaintext_t *pt, h_paillier_random_t *rand,
-                     unsigned int count) {
+                           h_paillier_plaintext_t *pt, h_paillier_random_t *rand,
+                           unsigned int count) {
   int32_t TPB = (params::TPB == 0)
                     ? 64
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
-
-  gpu_paillier_ciphertext_t *gpu_result;
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_plaintext_t *gpu_pt;
-  gpu_paillier_random_t *gpu_random;
-  cgbn_error_report_t *report;
 
   int32_t BPG = 256;
 
   CUDA_CHECK(cudaSetDevice(0));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t)));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_pt, sizeof(gpu_paillier_plaintext_t) * count));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_random, sizeof(gpu_paillier_random_t) * count));
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
 
-  CUDA_CHECK(cudaMemcpy(gpu_pub, pub, sizeof(gpu_paillier_pubkey_t),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_pt, (gpu_paillier_plaintext_t *)pt,
-                        sizeof(gpu_paillier_plaintext_t) * count,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_random, (gpu_paillier_random_t *)rand,
-                        sizeof(gpu_paillier_random_t) * count,
-                        cudaMemcpyHostToDevice));
+  // Acquire a stream from the shared stream pool
+  // StreamGuard automatically synchronizes on destruction
+  auto stream = get_stream();
 
-  // kernel_paillier_enc<params> << <(count + IPB - 1) / IPB, TPB >> > (report,
-  // gpu_result, gpu_pub, gpu_pt, gpu_random, count);
-  unsigned int ps, rep, rem, i = 0;
-  ps = TPB * BPG;  // kernel parallel
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_pt = make_device_buffer<gpu_paillier_plaintext_t>(count, stream);
+  auto gpu_random = make_device_buffer<gpu_paillier_random_t>(count, stream);
+
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), pub, sizeof(gpu_paillier_pubkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pt.data(), (gpu_paillier_plaintext_t *)pt,
+                             sizeof(gpu_paillier_plaintext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_random.data(), (gpu_paillier_random_t *)rand,
+                             sizeof(gpu_paillier_random_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+
+  // Launch kernel on stream
+  auto* result_ptr = static_cast<gpu_paillier_ciphertext_t*>(gpu_result.data());
+  auto* pub_ptr = static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data());
+  auto* pt_ptr = static_cast<gpu_paillier_plaintext_t*>(gpu_pt.data());
+  auto* random_ptr = static_cast<gpu_paillier_random_t*>(gpu_random.data());
+
+  unsigned int ps = TPB * BPG;  // kernel parallel
   if (ps < count) {
-    rep = count / ps;
-    for (i = 0; i < rep; i++) {
-      kernel_paillier_enc<params><<<(ps + IPB - 1) / IPB, TPB>>>(
-          report, &gpu_result[i * ps], gpu_pub, &gpu_pt[i * ps],
-          &gpu_random[i * ps], ps);
+    unsigned int rep = count / ps;
+    for (unsigned int i = 0; i < rep; i++) {
+      kernel_paillier_enc<params><<<(ps + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+          nullptr, &result_ptr[i * ps], pub_ptr, &pt_ptr[i * ps],
+          &random_ptr[i * ps], ps);
     }
-    rem = count - ps * rep;
-    kernel_paillier_enc<params><<<(rem + IPB - 1) / IPB, TPB>>>(
-        report, &gpu_result[i * ps], gpu_pub, &gpu_pt[i * ps],
-        &gpu_random[i * ps], rem);
+    unsigned int rem = count - ps * rep;
+    if (rem > 0) {
+      kernel_paillier_enc<params><<<(rem + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+          nullptr, &result_ptr[rep * ps], pub_ptr, &pt_ptr[rep * ps],
+          &random_ptr[rep * ps], rem);
+    }
   } else {
-    kernel_paillier_enc<params><<<(count + IPB - 1) / IPB, TPB>>>(
-        report, gpu_result, gpu_pub, gpu_pt, gpu_random, count);
+    kernel_paillier_enc<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+        nullptr, result_ptr, pub_ptr, pt_ptr, random_ptr, count);
   }
 
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
+
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_pt));
-  CUDA_CHECK(cudaFree(gpu_random));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // Stream is automatically returned to pool when stream_guard goes out of scope
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
+// Asynchronous version of gpu_paillier_dec using CUDA stream pool
+// All threads share a single stream pool for concurrent execution
 int gpu_paillier_dec(h_paillier_plaintext_t *res, h_paillier_pubkey_t *pub,
                      h_paillier_prvkey_t *prv, h_paillier_ciphertext_t *ct,
                      unsigned int count) {
@@ -639,90 +499,95 @@ int gpu_paillier_dec(h_paillier_plaintext_t *res, h_paillier_pubkey_t *pub,
                     ? 64
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
-  gpu_paillier_plaintext_t *gpu_result;
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_prvkey_t *gpu_prv;
-  gpu_paillier_ciphertext_t *gpu_ct;
 
-  cgbn_error_report_t *report;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_plaintext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t)));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_prv, sizeof(gpu_paillier_prvkey_t)));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct, sizeof(gpu_paillier_ciphertext_t) * count));
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_plaintext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_prv = make_device_buffer<gpu_paillier_prvkey_t>(1, stream);
+  auto gpu_ct = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
-  CUDA_CHECK(cudaMemcpy(gpu_pub, pub, sizeof(gpu_paillier_pubkey_t),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_prv, prv, sizeof(gpu_paillier_prvkey_t),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct, ct, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), pub, sizeof(gpu_paillier_pubkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_prv.data(), prv, sizeof(gpu_paillier_prvkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct.data(), ct, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  kernel_paillier_dec<params><<<(count + IPB - 1) / IPB, TPB>>>(
-      report, gpu_result, gpu_pub, gpu_prv, gpu_ct, count);
+  // Launch kernel on stream
+  kernel_paillier_dec<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_plaintext_t*>(gpu_result.data()),
+      static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data()),
+      static_cast<gpu_paillier_prvkey_t*>(gpu_prv.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct.data()),
+      count);
 
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_plaintext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
+
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_plaintext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_prv));
-  CUDA_CHECK(cudaFree(gpu_ct));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // Stream is automatically returned to pool when stream_guard goes out of scope
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
+// Asynchronous version of gpu_paillier_e_add using CUDA stream
+// Each call creates its own stream for concurrent execution
 int gpu_paillier_e_add(h_paillier_pubkey_t *pub, h_paillier_ciphertext_t *res,
                        h_paillier_ciphertext_t *ct0,
                        h_paillier_ciphertext_t *ct1, unsigned int count) {
+  NvtxRange chunk_range("gpu_paillier_e_add");
   // unsigned int TPI, TPB, IPB;
   int32_t TPB = (params::TPB == 0)
                     ? 64
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
-  gpu_paillier_ciphertext_t *gpu_result;
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_ciphertext_t *gpu_ct0;
-  gpu_paillier_ciphertext_t *gpu_ct1;
 
-  cgbn_error_report_t *report;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t) * 1));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct0, sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct1, sizeof(gpu_paillier_ciphertext_t) * count));
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_ct0 = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_ct1 = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
-  CUDA_CHECK(cudaMemcpy(gpu_pub, pub, sizeof(gpu_paillier_pubkey_t) * 1,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct0, ct0, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct1, ct1, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), pub, sizeof(gpu_paillier_pubkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct0.data(), ct0, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct1.data(), ct1, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  kernel_paillier_e_add<params><<<(count + IPB - 1) / IPB, TPB>>>(
-      report, gpu_result, gpu_pub, gpu_ct0, gpu_ct1, count);
+  // Launch kernel on stream
+  kernel_paillier_e_add<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_result.data()),
+      static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct0.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct1.data()),
+      count);
 
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
+
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_ct0));
-  CUDA_CHECK(cudaFree(gpu_ct1));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
@@ -734,37 +599,40 @@ int gpu_paillier_e_inverse(h_paillier_pubkey_t *pub,
                     ? 64
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
-  gpu_paillier_ciphertext_t *gpu_result;
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_ciphertext_t *gpu_ct;
 
-  cgbn_error_report_t *report;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t) * 1));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct, sizeof(gpu_paillier_ciphertext_t) * count));
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_ct = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
-  CUDA_CHECK(cudaMemcpy(gpu_pub, pub, sizeof(gpu_paillier_pubkey_t) * 1,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct, ct, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), pub, sizeof(gpu_paillier_pubkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct.data(), ct, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  kernel_paillier_inv<params><<<(count + IPB - 1) / IPB, TPB>>>(
-      report, gpu_result, gpu_pub, gpu_ct, count);
+  // Launch kernel on stream
+  kernel_paillier_inv<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_result.data()),
+      static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct.data()),
+      count);
 
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
+
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_ct));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // Stream is automatically returned to pool when stream_guard goes out of scope
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
@@ -778,47 +646,44 @@ int gpu_paillier_e_add_const(h_paillier_pubkey_t *pub,
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
 
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_ciphertext_t *gpu_result;
-  gpu_paillier_ciphertext_t *gpu_ct;
-  gpu_paillier_plaintext_t *gpu_constant;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  cgbn_error_report_t *report;
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_ct = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_constant = make_device_buffer<gpu_paillier_plaintext_t>(count, stream);
 
-  gpu_constant = (gpu_paillier_plaintext_t *)constant;
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), pub, sizeof(gpu_paillier_pubkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct.data(), ct, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_constant.data(), constant,
+                             sizeof(gpu_paillier_plaintext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t)));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct, sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_constant,
-                        sizeof(gpu_paillier_plaintext_t) * count));
+  // Launch kernel on stream
+  kernel_paillier_e_add_const<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_result.data()),
+      static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct.data()),
+      static_cast<gpu_paillier_plaintext_t*>(gpu_constant.data()),
+      count);
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
 
-  CUDA_CHECK(cudaMemcpy(gpu_pub, pub, sizeof(gpu_paillier_pubkey_t),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct, ct, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_constant, constant,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
-
-  kernel_paillier_e_add_const<params><<<(count + IPB - 1) / IPB, TPB>>>(
-      report, gpu_result, gpu_pub, gpu_ct, gpu_constant, count);
-
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_ct));
-  CUDA_CHECK(cudaFree(gpu_constant));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // Stream is automatically returned to pool when stream_guard goes out of scope
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
@@ -830,43 +695,44 @@ int gpu_paillier_sub_ct(h_paillier_pubkey_t *pub, h_paillier_ciphertext_t *res,
                     ? 64
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
-  gpu_paillier_ciphertext_t *gpu_result;
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_ciphertext_t *gpu_ct0;
-  gpu_paillier_ciphertext_t *gpu_ct1;
 
-  cgbn_error_report_t *report;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t) * 1));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct0, sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct1, sizeof(gpu_paillier_ciphertext_t) * count));
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_ct0 = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_ct1 = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
-  CUDA_CHECK(cudaMemcpy(gpu_pub, pub, sizeof(gpu_paillier_pubkey_t) * 1,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct0, ct0, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct1, ct1, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), pub, sizeof(gpu_paillier_pubkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct0.data(), ct0, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct1.data(), ct1, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  kernel_paillier_e_sub<params><<<(count + IPB - 1) / IPB, TPB>>>(
-      report, gpu_result, gpu_pub, gpu_ct0, gpu_ct1, count);
+  // Launch kernel on stream
+  kernel_paillier_e_sub<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_result.data()),
+      static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct0.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct1.data()),
+      count);
 
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
+
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_ct0));
-  CUDA_CHECK(cudaFree(gpu_ct1));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // Stream is automatically returned to pool when stream_guard goes out of scope
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
@@ -879,43 +745,44 @@ int gpu_paillier_sub_ctpt(h_paillier_pubkey_t *pub,
                     ? 64
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
-  gpu_paillier_ciphertext_t *gpu_result;
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_ciphertext_t *gpu_ct;
-  gpu_paillier_plaintext_t *gpu_pt;
 
-  cgbn_error_report_t *report;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t) * 1));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct, sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_pt, sizeof(gpu_paillier_plaintext_t) * count));
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_ct = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pt = make_device_buffer<gpu_paillier_plaintext_t>(count, stream);
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
-  CUDA_CHECK(cudaMemcpy(gpu_pub, pub, sizeof(gpu_paillier_pubkey_t) * 1,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct, ct, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_pt, pt, sizeof(gpu_paillier_plaintext_t) * count,
-                        cudaMemcpyHostToDevice));
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), pub, sizeof(gpu_paillier_pubkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct.data(), ct, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pt.data(), pt, sizeof(gpu_paillier_plaintext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  kernel_paillier_e_sub_ctpt<params><<<(count + IPB - 1) / IPB, TPB>>>(
-      report, gpu_result, gpu_pub, gpu_ct, gpu_pt, count);
+  // Launch kernel on stream
+  kernel_paillier_e_sub_ctpt<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_result.data()),
+      static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct.data()),
+      static_cast<gpu_paillier_plaintext_t*>(gpu_pt.data()),
+      count);
 
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
+
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_ct));
-  CUDA_CHECK(cudaFree(gpu_pt));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // Stream is automatically returned to pool when stream_guard goes out of scope
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
@@ -928,43 +795,44 @@ int gpu_paillier_sub_ptct(h_paillier_pubkey_t *pub,
                     ? 64
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
-  gpu_paillier_ciphertext_t *gpu_result;
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_ciphertext_t *gpu_ct;
-  gpu_paillier_plaintext_t *gpu_pt;
 
-  cgbn_error_report_t *report;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t) * 1));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct, sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_pt, sizeof(gpu_paillier_plaintext_t) * count));
+  // OPTIMIZATION: Use memory pool with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_ct = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pt = make_device_buffer<gpu_paillier_plaintext_t>(count, stream);
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
-  CUDA_CHECK(cudaMemcpy(gpu_pub, pub, sizeof(gpu_paillier_pubkey_t) * 1,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct, ct, sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_pt, pt, sizeof(gpu_paillier_plaintext_t) * count,
-                        cudaMemcpyHostToDevice));
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), pub, sizeof(gpu_paillier_pubkey_t),
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct.data(), ct, sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pt.data(), pt, sizeof(gpu_paillier_plaintext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  kernel_paillier_e_sub_ptct<params><<<(count + IPB - 1) / IPB, TPB>>>(
-      report, gpu_result, gpu_pub, gpu_pt, gpu_ct, count);
+  // Launch kernel on stream
+  kernel_paillier_e_sub_ptct<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_result.data()),
+      static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data()),
+      static_cast<gpu_paillier_plaintext_t*>(gpu_pt.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct.data()),
+      count);
 
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
+
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_ct));
-  CUDA_CHECK(cudaFree(gpu_pt));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // Stream is automatically returned to pool when stream_guard goes out of scope
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
@@ -977,46 +845,45 @@ int gpu_paillier_e_mul_const(h_paillier_pubkey_t *pub,
                     ? 64
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;
-  gpu_paillier_ciphertext_t *gpu_result;
-  gpu_paillier_pubkey_t *gpu_pub;
-  gpu_paillier_ciphertext_t *gpu_ct;
-  gpu_paillier_plaintext_t *gpu_constant;
 
-  cgbn_error_report_t *report;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  gpu_constant = (gpu_paillier_plaintext_t *)constant;
-  CUDA_CHECK(cudaMalloc((void **)&gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_pub, sizeof(gpu_paillier_pubkey_t)));
-  CUDA_CHECK(
-      cudaMalloc((void **)&gpu_ct, sizeof(gpu_paillier_ciphertext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_constant,
-                        sizeof(gpu_paillier_plaintext_t) * count));
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_result = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_pub = make_device_buffer<gpu_paillier_pubkey_t>(1, stream);
+  auto gpu_ct = make_device_buffer<gpu_paillier_ciphertext_t>(count, stream);
+  auto gpu_constant = make_device_buffer<gpu_paillier_plaintext_t>(count, stream);
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
-  CUDA_CHECK(cudaMemcpy(gpu_pub, (gpu_paillier_pubkey_t *)pub,
-                        sizeof(gpu_paillier_pubkey_t), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_ct, (gpu_paillier_ciphertext_t *)ct,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_constant, constant,
-                        sizeof(gpu_paillier_plaintext_t) * count,
-                        cudaMemcpyHostToDevice));
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_pub.data(), (gpu_paillier_pubkey_t *)pub,
+                             sizeof(gpu_paillier_pubkey_t), cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_ct.data(), (gpu_paillier_ciphertext_t *)ct,
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_constant.data(), constant,
+                             sizeof(gpu_paillier_plaintext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  kernel_paillier_e_mul_const<params><<<(count + IPB - 1) / IPB, TPB>>>(
-      report, gpu_result, gpu_pub, gpu_ct, gpu_constant, count);
+  // Launch kernel on stream
+  kernel_paillier_e_mul_const<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_result.data()),
+      static_cast<gpu_paillier_pubkey_t*>(gpu_pub.data()),
+      static_cast<gpu_paillier_ciphertext_t*>(gpu_ct.data()),
+      static_cast<gpu_paillier_plaintext_t*>(gpu_constant.data()),
+      count);
 
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Asynchronous memory copy: device to host
+  CUDA_CHECK(cudaMemcpyAsync(res, gpu_result.data(),
+                             sizeof(gpu_paillier_ciphertext_t) * count,
+                             cudaMemcpyDeviceToHost, stream.value()));
+
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaMemcpy(res, gpu_result,
-                        sizeof(gpu_paillier_ciphertext_t) * count,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(gpu_result));
-  CUDA_CHECK(cudaFree(gpu_pub));
-  CUDA_CHECK(cudaFree(gpu_ct));
-  CUDA_CHECK(cudaFree(gpu_constant));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }
 
@@ -1027,30 +894,32 @@ int gpu_paillier_compare(h_paillier_plaintext_t *plain, unsigned int *res,
                     : params::TPB;  // default threads per block to 128
   int32_t TPI = params::TPI, IPB = TPB / TPI;  // IPB is instances per block
 
-  gpu_paillier_plaintext_t *gpu_plain;
-  unsigned int *gpu_res;
+  // Acquire a stream from the shared stream pool
+  StreamGuard stream_guard;
+  rmm::cuda_stream_view stream = stream_guard.stream();
 
-  cgbn_error_report_t *report;
+  // OPTIMIZATION: Use RMM device_buffer with stream-ordered allocation
+  auto gpu_plain = make_device_buffer<gpu_paillier_plaintext_t>(count, stream);
+  auto gpu_res = make_device_buffer<unsigned int>(count, stream);
 
-  CUDA_CHECK(cudaMalloc((void **)&gpu_plain,
-                        sizeof(gpu_paillier_plaintext_t) * count));
-  CUDA_CHECK(cudaMalloc((void **)&gpu_res, sizeof(unsigned int) * count));
+  // Asynchronous memory copy: host to device
+  CUDA_CHECK(cudaMemcpyAsync(gpu_plain.data(), plain,
+                             sizeof(gpu_paillier_plaintext_t) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
+  CUDA_CHECK(cudaMemcpyAsync(gpu_res.data(), res, sizeof(unsigned int) * count,
+                             cudaMemcpyHostToDevice, stream.value()));
 
-  CUDA_CHECK(cgbn_error_report_alloc(&report));
-  CUDA_CHECK(cudaMemcpy(gpu_plain, plain,
-                        sizeof(gpu_paillier_plaintext_t) * count,
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpu_res, res, sizeof(unsigned int) * count,
-                        cudaMemcpyHostToDevice));
+  // Launch kernel on stream
+  kernel_paillier_compare<params><<<(count + IPB - 1) / IPB, TPB, 0, stream.value()>>>(
+      nullptr,
+      static_cast<gpu_paillier_plaintext_t*>(gpu_plain.data()),
+      static_cast<unsigned int*>(gpu_res.data()),
+      count);
 
-  kernel_paillier_compare<params>
-      <<<(count + IPB - 1) / IPB, TPB>>>(report, gpu_plain, gpu_res, count);
-
-  CUDA_CHECK(cudaDeviceSynchronize());
+  // Now safe to check errors after GPU operations complete
   CUDA_LAST_CHECK();
-  CGBN_CHECK(report);
-  CUDA_CHECK(cudaFree(gpu_plain));
-  CUDA_CHECK(cudaFree(gpu_res));
-  CUDA_CHECK(cgbn_error_report_free(report));
+
+  // Stream is automatically returned to pool when stream_guard goes out of scope
+  // device_buffer automatically frees memory when it goes out of scope
   return 0;
 }

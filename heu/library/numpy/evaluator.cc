@@ -20,6 +20,7 @@
 #include "yacl/utils/parallel.h"
 
 #include "heu/library/numpy/shape.h"
+#include "nvtx3/nvToolsExt.h"
 
 namespace heu::lib::numpy {
 
@@ -117,6 +118,7 @@ using kHasReduceSum = decltype(std::declval<const CLAZZ &>().ReduceSum(
                   std::array<int64_t, 2> y_stride, RET *out)                 \
       ->std::enable_if_t<std::experimental::is_detected_v<                   \
           kHasVectorized##OP, CLAZZ, SUB_TX, SUB_TY>> {                      \
+    nvtxRangePushA("DoCall" #OP " (Vectorized)");                            \
     const auto *x_base = x.data();                                           \
     const auto *y_base = y.data();                                           \
     RET::value_type *out_base = out->data();                                 \
@@ -139,6 +141,7 @@ using kHasReduceSum = decltype(std::declval<const CLAZZ &>().ReduceSum(
         out_base[i] = RET::value_type(std::move(res[i - beg]));              \
       }                                                                      \
     });                                                                      \
+    nvtxRangePop();                                                          \
   }                                                                          \
                                                                              \
   template <typename CLAZZ, typename SUB_TX, typename SUB_TY>                \
@@ -167,6 +170,7 @@ using kHasReduceSum = decltype(std::declval<const CLAZZ &>().ReduceSum(
                                                                              \
   RET Evaluator::OP(const DenseMatrix<phe::TX> &x,                           \
                     const DenseMatrix<phe::TY> &y) const {                   \
+    nvtxRangePushA("Evaluator::" #OP);                                       \
     Dimension sx(x);                                                         \
     Dimension sy(y);                                                         \
     YACL_ENFORCE(sx.IsCompatibleShape(sy),                                   \
@@ -180,8 +184,11 @@ using kHasReduceSum = decltype(std::declval<const CLAZZ &>().ReduceSum(
     const auto x_stride = ComputeCastStride(x_old_stride, sx, sz);           \
     const auto y_stride = ComputeCastStride(y_old_stride, sy, sz);           \
                                                                              \
+    nvtxRangePushA("alloc out"); \
     RET out(sz.rows, sz.cols, sz.ndim);                                      \
+    nvtxRangePop();\
     std::visit(HE_DISPATCH(DO_CALL_OP, OP, TX, TY), evaluator_ptr_);         \
+    nvtxRangePop();                                                          \
     return out;                                                              \
   }
 

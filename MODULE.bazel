@@ -75,4 +75,4 @@ bazel_dep(name = "googletest", version = "1.15.2", dev_dependency = True)
 bazel_dep(name = "google_benchmark", version = "1.8.5", dev_dependency = True)
 
 non_module_dependencies = use_extension("//bazel:defs.bzl", "non_module_dependencies")
-use_repo(non_module_dependencies, "com_github_nvlabs_cgbn")
+use_repo(non_module_dependencies, "com_github_nvlabs_cgbn", "rmm")
